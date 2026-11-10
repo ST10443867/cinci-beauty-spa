@@ -1,0 +1,376 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Assumed data models:
+    // users/{uid}: uid, email, displayName, role and createdAt. Email and role are
+    // private; only the owner can read the profile. Role changes are not client-writable.
+    // bookings/{id}: serviceId, service, price, contactChannel, date, time, name,
+    // email, phone, status and createdAt. Contact values are format-validated but
+    // not verified; customers create paired bookings/slots, admins read and manage.
+    // slots/{date_HHmm}: date, time and bookingId. Public availability only, no customer PII.
+    // servicePrices/{serviceId}: serviceId, serviceName, priceLabel, updatedAt
+    // and lastAuditId. Public catalog values; admins change prices with an atomic audit.
+    // priceAudit/{id}: serviceId, serviceName, previousPrice, newPrice,
+    // changedByUid, changedByEmail and changedAt. Admin-only history.
+    // reviews/{id}: name, rating, comment, approved and createdAt. Public read only
+    // for approved reviews; unapproved entries are restricted to admins.
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function uidUnchanged() {
+      return isAuthenticated() &&
+        (!("uid" in request.resource.data) || request.resource.data.uid == request.auth.uid);
+    }
+
+    function uidNotModified() {
+      return isAuthenticated() &&
+        (!("uid" in request.resource.data) || request.resource.data.uid == resource.data.uid);
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    function validEmail(email) {
+      return email is string &&
+        email.size() >= 3 &&
+        email.size() <= 254 &&
+        email.matches("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
+    }
+
+    function validPriceLabel(label) {
+      return label is string &&
+        label.size() >= 2 &&
+        label.size() <= 14 &&
+        label.matches("^\\+?R([1-9][0-9]{0,2}(,[0-9]{3})*|[1-9][0-9]*)$");
+    }
+
+    function validUserProfile(data, userId) {
+      return data.keys().hasAll(["uid", "email", "displayName", "role", "createdAt"]) &&
+        data.keys().hasOnly(["uid", "email", "displayName", "role", "createdAt"]) &&
+        data.uid == userId &&
+        request.auth.uid == userId &&
+        uidUnchanged() &&
+        validEmail(data.email) &&
+        data.email == request.auth.token.email &&
+        data.displayName is string &&
+        data.displayName.size() >= 2 &&
+        data.displayName.size() <= 80 &&
+        data.role in ["pending", "admin"] &&
+        data.createdAt is timestamp;
+    }
+
+    function validDate(date) {
+      return date is string && date.matches("^\\d{4}-\\d{2}-\\d{2}$");
+    }
+
+    function validTime(time) {
+      return time is string &&
+        time in ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00"];
+    }
+
+    function slotIdFor(date, time) {
+      return date + "_" +
+        (time == "09:00" ? "0900" :
+          time == "10:00" ? "1000" :
+          time == "11:00" ? "1100" :
+          time == "12:00" ? "1200" :
+          time == "13:00" ? "1300" :
+          time == "14:00" ? "1400" :
+          time == "15:00" ? "1500" : "1600");
+    }
+
+    function validBooking(data, isCreate) {
+      return data.keys().hasAll([
+          "service", "price", "date", "time", "name", "email", "phone", "status", "createdAt"
+        ]) &&
+        data.keys().hasOnly([
+          "serviceId", "service", "price", "contactChannel", "date", "time", "name", "email", "phone", "status", "createdAt"
+        ]) &&
+        (!isCreate || data.keys().hasAll(["serviceId", "contactChannel"])) &&
+        (!("serviceId" in data) ||
+          (data.serviceId is string && data.serviceId.matches("^[a-z0-9]+(-[a-z0-9]+)*$"))) &&
+        (!("contactChannel" in data) || data.contactChannel in ["email", "sms"]) &&
+        data["service"] is string &&
+        data["service"].size() >= 2 &&
+        data["service"].size() <= 100 &&
+        data.price is string && data.price.size() >= 1 && data.price.size() <= 30 &&
+        validPriceLabel(data.price) &&
+        validDate(data.date) &&
+        validTime(data.time) &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 100 &&
+        validEmail(data.email) &&
+        data.phone is string &&
+        (data.phone.matches("^[0-9]{10}$") ||
+          (!isCreate && data.phone.matches("^\\+27[6-8][0-9]{8}$"))) &&
+        (!("contactChannel" in data) || data.contactChannel != "sms" ||
+          data.phone.matches("^0[6-8][0-9]{8}$") ||
+          (!isCreate && data.phone.matches("^\\+27[6-8][0-9]{8}$"))) &&
+        data.status in ["Pending", "Confirmed", "Cancelled"] &&
+        data.createdAt is timestamp &&
+        (!isCreate || (data.status == "Pending" && data.createdAt == request.time));
+    }
+
+    function validSlot(data, documentId) {
+      return data.keys().hasAll(["date", "time", "bookingId"]) &&
+        data.keys().hasOnly(["date", "time", "bookingId"]) &&
+        validDate(data.date) &&
+        validTime(data.time) &&
+        data.bookingId is string &&
+        data.bookingId.size() >= 1 &&
+        data.bookingId.size() <= 20 &&
+        documentId == slotIdFor(data.date, data.time);
+    }
+
+    function bookingHasSlotAfter(bookingId, date, time) {
+      let slotPath = /databases/$(database)/documents/slots/$(slotIdFor(date, time));
+      return existsAfter(slotPath) &&
+        getAfter(slotPath).data.bookingId == bookingId &&
+        getAfter(slotPath).data.date == date &&
+        getAfter(slotPath).data.time == time;
+    }
+
+    function currentServiceNameMatches(pricePath) {
+      return getAfter(pricePath).data.serviceName == request.resource.data["service"];
+    }
+
+    function currentPriceLabelMatches(pricePath) {
+      return getAfter(pricePath).data.priceLabel == request.resource.data.price;
+    }
+
+    function hasCurrentServicePrice(data) {
+      let pricePath = /databases/$(database)/documents/servicePrices/$(data.serviceId);
+      return exists(pricePath) &&
+        currentServiceNameMatches(pricePath) &&
+        currentPriceLabelMatches(pricePath);
+    }
+
+    function slotHasBookingAfter(data, documentId) {
+      let bookingPath = /databases/$(database)/documents/bookings/$(data.bookingId);
+      return existsAfter(bookingPath) &&
+        getAfter(bookingPath).data.date == data.date &&
+        getAfter(bookingPath).data.time == data.time &&
+        slotIdFor(getAfter(bookingPath).data.date, getAfter(bookingPath).data.time) == documentId &&
+        getAfter(bookingPath).data.status in ["Pending", "Confirmed"];
+    }
+
+    function validBookingUpdate(bookingId) {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return isAdmin() &&
+        validBooking(request.resource.data, false) &&
+        changed.hasOnly(["status", "date", "time"]) &&
+        (
+          (
+            changed.hasOnly(["status"]) &&
+            (
+              (resource.data.status == "Pending" &&
+                request.resource.data.status in ["Confirmed", "Cancelled"]) ||
+              (resource.data.status == "Confirmed" &&
+                request.resource.data.status == "Cancelled")
+            )
+          ) ||
+          (
+            changed.hasOnly(["date", "time"]) &&
+            changed.hasAny(["date", "time"]) &&
+            resource.data.status != "Cancelled" &&
+            (
+              request.resource.data.date != resource.data.date ||
+              request.resource.data.time != resource.data.time
+            ) &&
+            bookingHasSlotAfter(bookingId, request.resource.data.date, request.resource.data.time)
+          )
+        );
+    }
+
+    function validReview(data) {
+      return data.keys().hasAll(["name", "rating", "comment", "approved", "createdAt"]) &&
+        data.keys().hasOnly(["name", "rating", "comment", "approved", "createdAt"]) &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 60 &&
+        data.rating is int && data.rating >= 1 && data.rating <= 5 &&
+        data.comment is string && data.comment.size() >= 3 && data.comment.size() <= 600 &&
+        data.approved is bool &&
+        data.createdAt is timestamp;
+    }
+
+    function validReviewUpdate(data) {
+      let changed = data.diff(resource.data).affectedKeys();
+      return validReview(data) &&
+        changed.hasOnly(["approved"]) &&
+        resource.data.approved == false &&
+        data.approved == true &&
+        data.name == resource.data.name &&
+        data.rating == resource.data.rating &&
+        data.comment == resource.data.comment &&
+        data.createdAt == resource.data.createdAt;
+    }
+
+    function validServicePrice(data, serviceId) {
+      return data.keys().hasAll([
+          "serviceId", "serviceName", "priceLabel", "updatedAt", "lastAuditId"
+        ]) &&
+        data.keys().hasOnly([
+          "serviceId", "serviceName", "priceLabel", "updatedAt", "lastAuditId"
+        ]) &&
+        data.serviceId == serviceId &&
+        data.serviceName is string &&
+        data.serviceName.size() >= 2 &&
+        data.serviceName.size() <= 100 &&
+        validPriceLabel(data.priceLabel) &&
+        data.updatedAt is timestamp &&
+        data.lastAuditId is string &&
+        data.lastAuditId.matches("^[A-Za-z0-9_-]{20}$");
+    }
+
+    function validPriceAudit(data) {
+      return data.keys().hasAll([
+          "serviceId", "serviceName", "previousPrice", "newPrice",
+          "changedByUid", "changedByEmail", "changedAt"
+        ]) &&
+        data.keys().hasOnly([
+          "serviceId", "serviceName", "previousPrice", "newPrice",
+          "changedByUid", "changedByEmail", "changedAt"
+        ]) &&
+        data.serviceId is string &&
+        data.serviceId.matches("^[a-z0-9]+(-[a-z0-9]+)*$") &&
+        data.serviceName is string &&
+        data.serviceName.size() >= 2 &&
+        data.serviceName.size() <= 100 &&
+        data.previousPrice is string &&
+        data.previousPrice.size() <= 14 &&
+        (data.previousPrice == "Not set" || validPriceLabel(data.previousPrice)) &&
+        validPriceLabel(data.newPrice) &&
+        data.changedByUid == request.auth.uid &&
+        data.changedByEmail is string &&
+        data.changedByEmail.size() <= 254 &&
+        data.changedAt is timestamp;
+    }
+
+    function priceHasAuditAfter(serviceId, serviceName, auditId, previousPrice, newPrice) {
+      let auditPath = /databases/$(database)/documents/priceAudit/$(auditId);
+      return existsAfter(auditPath) &&
+        getAfter(auditPath).data.serviceId == serviceId &&
+        getAfter(auditPath).data.serviceName == serviceName &&
+        getAfter(auditPath).data.previousPrice == previousPrice &&
+        getAfter(auditPath).data.newPrice == newPrice &&
+        getAfter(auditPath).data.changedByUid == request.auth.uid &&
+        getAfter(auditPath).data.changedAt == request.time;
+    }
+
+    function priceHasUpdateAfter(data, auditId) {
+      let pricePath = /databases/$(database)/documents/servicePrices/$(data.serviceId);
+      return existsAfter(pricePath) &&
+        getAfter(pricePath).data.lastAuditId == auditId &&
+        getAfter(pricePath).data.serviceName == data.serviceName &&
+        getAfter(pricePath).data.priceLabel == data.newPrice &&
+        getAfter(pricePath).data.updatedAt == request.time;
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) &&
+        validUserProfile(request.resource.data, userId) &&
+        request.resource.data.role == "pending" &&
+        request.resource.data.createdAt == request.time;
+      allow update: if isOwner(userId) &&
+        validUserProfile(request.resource.data, userId) &&
+        uidNotModified() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["displayName"]) &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    match /bookings/{bookingId} {
+      allow get, list: if isAdmin();
+      allow create: if validBooking(request.resource.data, true) &&
+        request.resource.data.status == "Pending" &&
+        request.resource.data.createdAt == request.time &&
+        hasCurrentServicePrice(request.resource.data) &&
+        bookingHasSlotAfter(bookingId, request.resource.data.date, request.resource.data.time);
+      allow update: if validBookingUpdate(bookingId);
+      allow delete: if false;
+    }
+
+    match /slots/{slotDocumentId} {
+      allow get, list: if true;
+      allow create: if
+        validSlot(request.resource.data, slotDocumentId) &&
+        slotHasBookingAfter(request.resource.data, slotDocumentId) &&
+        (isAdmin() ||
+          !exists(/databases/$(database)/documents/bookings/$(request.resource.data.bookingId)));
+      allow update: if isAdmin() &&
+        validSlot(request.resource.data, slotDocumentId) &&
+        resource.data.bookingId == request.resource.data.bookingId;
+      allow delete: if isAdmin() &&
+        validSlot(resource.data, slotDocumentId) &&
+        existsAfter(/databases/$(database)/documents/bookings/$(resource.data.bookingId)) &&
+        (
+          getAfter(/databases/$(database)/documents/bookings/$(resource.data.bookingId)).data.status == "Cancelled" ||
+          getAfter(/databases/$(database)/documents/bookings/$(resource.data.bookingId)).data.date != resource.data.date ||
+          getAfter(/databases/$(database)/documents/bookings/$(resource.data.bookingId)).data.time != resource.data.time
+        );
+    }
+
+    match /servicePrices/{serviceId} {
+      allow get, list: if true;
+      allow create: if isAdmin() &&
+        validServicePrice(request.resource.data, serviceId) &&
+        request.resource.data.updatedAt == request.time &&
+        priceHasAuditAfter(
+          serviceId,
+          request.resource.data.serviceName,
+          request.resource.data.lastAuditId,
+          "Not set",
+          request.resource.data.priceLabel
+        );
+      allow update: if isAdmin() &&
+        validServicePrice(request.resource.data, serviceId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["priceLabel", "updatedAt", "lastAuditId"]) &&
+        request.resource.data.serviceName == resource.data.serviceName &&
+        request.resource.data.updatedAt == request.time &&
+        request.resource.data.priceLabel != resource.data.priceLabel &&
+        priceHasAuditAfter(
+          serviceId,
+          request.resource.data.serviceName,
+          request.resource.data.lastAuditId,
+          resource.data.priceLabel,
+          request.resource.data.priceLabel
+        );
+      allow delete: if false;
+    }
+
+    match /priceAudit/{auditId} {
+      allow get, list: if isAdmin();
+      allow create: if isAdmin() &&
+        validPriceAudit(request.resource.data) &&
+        request.resource.data.changedAt == request.time &&
+        priceHasUpdateAfter(request.resource.data, auditId);
+      allow update, delete: if false;
+    }
+
+    match /reviews/{reviewId} {
+      allow get, list: if isAdmin() || resource.data.approved == true;
+      allow create: if validReview(request.resource.data) &&
+        request.resource.data.approved == false &&
+        request.resource.data.createdAt == request.time;
+      allow update: if isAdmin() && validReviewUpdate(request.resource.data);
+      allow delete: if isAdmin() && validReview(resource.data);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
